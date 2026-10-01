@@ -33,6 +33,7 @@ const (
 	ReferenceExtractorMarker          = "crossplane:generate:reference:extractor"
 	ReferenceReferenceFieldNameMarker = "crossplane:generate:reference:refFieldName"
 	ReferenceSelectorFieldNameMarker  = "crossplane:generate:reference:selectorFieldName"
+	ReferenceAPIVersionMarker         = "crossplane:generate:reference:apiVersion"
 )
 
 var regexFunctionCall = regexp.MustCompile(`((.+)\.)?([^.]+\(.*\))`)
@@ -78,6 +79,35 @@ type Reference struct {
 
 	// IsFloatPointer tells whether the current value pointer is of type float64
 	IsFloatPointer bool
+
+	// Targets are the targets of a multi-kind reference, whose reference and
+	// selector choose a target by apiVersion and kind. The first target is
+	// the default. Targets is empty for a single-target reference.
+	Targets []ReferenceTarget
+
+	// NewReference is the function that returns the reference to store for
+	// a resolved multi-kind reference, given its apiVersion, kind and the
+	// resolved reference.
+	NewReference *jen.Statement
+}
+
+// ReferenceTarget is one of the targets of a multi-kind reference.
+type ReferenceTarget struct {
+	// APIVersion of the target, as group/version.
+	APIVersion string
+
+	// Kind of the target.
+	Kind string
+
+	// RemoteType is the type of the target.
+	RemoteType *jen.Statement
+
+	// RemoteListType is the list type of the target.
+	RemoteListType *jen.Statement
+
+	// Extractor is the function call that returns the value to set from a
+	// target instance.
+	Extractor *jen.Statement
 }
 
 // ReferenceProcessorOption is used to configure ReferenceProcessor.
@@ -115,7 +145,17 @@ type ReferenceProcessor struct {
 }
 
 // Process stores the reference information of the given field, if any.
-func (rp *ReferenceProcessor) Process(_ *types.Named, f *types.Var, _, comment string, parentFields ...string) error {
+//
+// A field whose markers include apiVersion markers is a multi-kind reference:
+// its type markers list the targets, the first of which is the default, and
+// its apiVersion markers list their API versions in the same order. Its
+// extractor markers are either absent, or one per target in the same order.
+// The reference and selector fields of a multi-kind reference must have
+// nil-safe GetAPIVersion and GetKind methods, a ToReference or ToSelector
+// method that returns the reference or selector to resolve, and the package
+// of the reference field's type must have a New<type name>(apiVersion, kind
+// string, resolved) function that returns the reference to store.
+func (rp *ReferenceProcessor) Process(n *types.Named, f *types.Var, _, comment string, parentFields ...string) error { //nolint:gocyclo // Mostly validation; easier to follow in one place.
 	markers := comments.ParseMarkers(comment)
 	refTypeValues := markers[ReferenceTypeMarker]
 	if len(refTypeValues) == 0 {
@@ -163,8 +203,25 @@ func (rp *ReferenceProcessor) Process(_ *types.Named, f *types.Var, _, comment s
 	if values, ok := markers[ReferenceSelectorFieldNameMarker]; ok {
 		selectorFieldName = values[0]
 	}
+	var targets []ReferenceTarget
+	var newReference *jen.Statement
+	if apiVersions, ok := markers[ReferenceAPIVersionMarker]; ok {
+		var err error
+		if targets, err = getReferenceTargets(refTypeValues, apiVersions, markers[ReferenceExtractorMarker], rp.DefaultExtractor); err != nil {
+			return errors.Wrapf(err, "cannot process the multi-kind reference of field %s", f.Name())
+		}
+		if isList {
+			return errors.Errorf("cannot process the multi-kind reference of field %s: multi-kind references are not supported for slice fields", f.Name())
+		}
+		if newReference, err = getNewReferenceFunc(n, refFieldName); err != nil {
+			return errors.Wrapf(err, "cannot process the multi-kind reference of field %s", f.Name())
+		}
+	}
+
 	path := append([]string{rp.Receiver}, parentFields...)
 	rp.refs = append(rp.refs, Reference{
+		Targets:             targets,
+		NewReference:        newReference,
 		RemoteType:          getTypeCodeFromPath(refType),
 		RemoteListType:      getTypeCodeFromPath(refType, "List"),
 		Extractor:           extractorPath,
@@ -177,6 +234,73 @@ func (rp *ReferenceProcessor) Process(_ *types.Named, f *types.Var, _, comment s
 		IsFloatPointer:      isFloatPointer,
 	})
 	return nil
+}
+
+// getReferenceTargets returns the targets of a multi-kind reference from its
+// type, apiVersion and extractor marker values.
+func getReferenceTargets(refTypes, apiVersions, extractors []string, defaultExtractor *jen.Statement) ([]ReferenceTarget, error) {
+	if len(apiVersions) != len(refTypes) {
+		return nil, errors.Errorf("got %d apiVersion markers for %d type markers, want one per type", len(apiVersions), len(refTypes))
+	}
+	if len(extractors) != 0 && len(extractors) != len(refTypes) {
+		return nil, errors.Errorf("got %d extractor markers for %d type markers, want none or one per type", len(extractors), len(refTypes))
+	}
+	targets := make([]ReferenceTarget, len(refTypes))
+	seen := map[string]bool{}
+	for i, t := range refTypes {
+		if strings.Count(apiVersions[i], "/") != 1 {
+			return nil, errors.Errorf("apiVersion %q of type %s is not of the form group/version", apiVersions[i], t)
+		}
+		kind := t[strings.LastIndex(t, ".")+1:]
+		id := apiVersions[i] + ", Kind=" + kind
+		if seen[id] {
+			return nil, errors.Errorf("%s is configured more than once", id)
+		}
+		seen[id] = true
+		extractor := defaultExtractor
+		if len(extractors) != 0 {
+			var err error
+			if extractor, err = getFuncCodeFromPath(extractors[i]); err != nil {
+				return nil, errors.Wrapf(err, "cannot get extractor function")
+			}
+		}
+		targets[i] = ReferenceTarget{
+			APIVersion:     apiVersions[i],
+			Kind:           kind,
+			RemoteType:     getTypeCodeFromPath(t),
+			RemoteListType: getTypeCodeFromPath(t, "List"),
+			Extractor:      extractor,
+		}
+	}
+	return targets, nil
+}
+
+// getNewReferenceFunc returns the New<type name> function of the type of the
+// supplied reference field of the supplied struct.
+func getNewReferenceFunc(n *types.Named, refFieldName string) (*jen.Statement, error) {
+	st, ok := n.Underlying().(*types.Struct)
+	if !ok {
+		return nil, errors.Errorf("%s is not a struct", n.Obj().Name())
+	}
+	for f := range st.Fields() {
+		if f.Name() != refFieldName {
+			continue
+		}
+		t := f.Type()
+		if p, ok := t.(*types.Pointer); ok {
+			t = p.Elem()
+		}
+		rt, ok := t.(*types.Named)
+		if !ok || rt.Obj().Pkg() == nil {
+			return nil, errors.Errorf("reference field %s must be of a named type, got %s", refFieldName, f.Type())
+		}
+		fn := "New" + rt.Obj().Name()
+		if _, ok := rt.Obj().Pkg().Scope().Lookup(fn).(*types.Func); !ok {
+			return nil, errors.Errorf("package %s must have a function %s that returns the reference to store for a resolved reference", rt.Obj().Pkg().Path(), fn)
+		}
+		return jen.Qual(rt.Obj().Pkg().Path(), fn), nil
+	}
+	return nil, errors.Errorf("%s has no reference field %s", n.Obj().Name(), refFieldName)
 }
 
 // GetReferences returns all the references accumulated so far from processing.

@@ -150,11 +150,18 @@ type ReferenceProcessor struct {
 // its type markers list the targets, the first of which is the default, and
 // its apiVersion markers list their API versions in the same order. Its
 // extractor markers are either absent, or one per target in the same order.
-// The reference and selector fields of a multi-kind reference must have
-// nil-safe GetAPIVersion and GetKind methods, a ToReference or ToSelector
-// method that returns the reference or selector to resolve, and the package
-// of the reference field's type must have a New<type name>(apiVersion, kind
-// string, resolved) function that returns the reference to store.
+// The reference and selector fields of a multi-kind reference are pointers
+// that are nil when unset, and the generated code calls their methods without
+// checking for nil, so their types must have:
+//
+//   - GetAPIVersion and GetKind methods that return "" for a nil receiver,
+//   - a ToReference (reference) or ToSelector (selector) method that returns
+//     the reference or selector to resolve, and nil for a nil receiver.
+//
+// The package of the reference field's type must have a New<type name>(
+// apiVersion, kind string, resolved) function that returns the reference to
+// store. It must return nil when resolved is nil, which happens when
+// resolution is a no-op and there was no reference to begin with.
 func (rp *ReferenceProcessor) Process(n *types.Named, f *types.Var, _, comment string, parentFields ...string) error { //nolint:gocyclo // Mostly validation; easier to follow in one place.
 	markers := comments.ParseMarkers(comment)
 	refTypeValues := markers[ReferenceTypeMarker]
@@ -248,7 +255,7 @@ func getReferenceTargets(refTypes, apiVersions, extractors []string, defaultExtr
 	targets := make([]ReferenceTarget, len(refTypes))
 	seen := map[string]bool{}
 	for i, t := range refTypes {
-		if strings.Count(apiVersions[i], "/") != 1 {
+		if gv := strings.Split(apiVersions[i], "/"); len(gv) != 2 || gv[0] == "" || gv[1] == "" {
 			return nil, errors.Errorf("apiVersion %q of type %s is not of the form group/version", apiVersions[i], t)
 		}
 		kind := t[strings.LastIndex(t, ".")+1:]

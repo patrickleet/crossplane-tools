@@ -286,6 +286,20 @@ type Parameters struct {
 	UserID *string`,
 			want: `cannot process the multi-kind reference of field UserID: apiVersion "v1" of type HumanUser is not of the form group/version`,
 		},
+		"EmptyGroup": {
+			field: `
+	// +crossplane:generate:reference:type=HumanUser
+	// +crossplane:generate:reference:apiVersion=/v1
+	UserID *string`,
+			want: `cannot process the multi-kind reference of field UserID: apiVersion "/v1" of type HumanUser is not of the form group/version`,
+		},
+		"EmptyVersion": {
+			field: `
+	// +crossplane:generate:reference:type=HumanUser
+	// +crossplane:generate:reference:apiVersion=user.example.org/
+	UserID *string`,
+			want: `cannot process the multi-kind reference of field UserID: apiVersion "user.example.org/" of type HumanUser is not of the form group/version`,
+		},
 		"DuplicateTarget": {
 			field: `
 	// +crossplane:generate:reference:type=HumanUser
